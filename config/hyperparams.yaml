@@ -1,0 +1,54 @@
+# =============================================================================
+# Tetris AI — Hyperparameters & Configuration (Phase 1b)
+# =============================================================================
+
+# ---------------------
+# Game Settings
+# ---------------------
+board_width: 10
+board_height: 30
+visible_height: 20
+# Placement-based with hold: 80 actions (40 place + 40 hold-place)
+
+# ---------------------
+# Training
+# ---------------------
+# Training runs indefinitely (Ctrl+C to stop)
+lr_cycle_episodes: 50000       # cosine annealing restarts every N episodes
+batch_size: 256
+gamma: 0.97                    # Phase 1b: was 0.95, longer planning horizon
+learning_rate: 0.00025
+min_learning_rate: 0.00001     # cosine annealing floor
+replay_buffer_size: 200000     # Phase 1b: was 100k, more diverse experience
+min_replay_size: 1000          # warmup: collect this many transitions before training
+tau: 0.002                     # Phase 1b: was 0.005, more stable target network
+epsilon_start: 1.0
+epsilon_end: 0.01
+epsilon_decay_episodes: 100000
+train_every_n_steps: 4
+max_steps_per_episode: 5000    # safety cap
+
+# ---------------------
+# Reward Shaping
+# ---------------------
+# Line rewards: [0, 5, 15, 40, 150] for 0-4 lines (Phase 1b: Tetris 100→150)
+# Clean placement bonus: +0.5 per piece locked with 0 new holes
+# Survival bonus: +0.1 per piece placed (not game over)
+holes_weight: 0.3
+height_weight: 0.03
+bumpiness_weight: 0.01
+game_over_penalty: 35.0        # Phase 1b: was 25, stronger death penalty
+
+# ---------------------
+# Rendering
+# ---------------------
+cell_size: 30
+fps: 60
+render_during_training: false
+
+# ---------------------
+# Checkpoints & Logging
+# ---------------------
+save_freq: 500
+checkpoint_dir: "checkpoints"
+log_dir: "runs"
