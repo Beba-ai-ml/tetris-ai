@@ -35,7 +35,7 @@ Tetris AI is a placement-based Tetris agent trained with **Afterstate V-learning
 
 The agent operates over an **80-action discrete space**: 40 direct placements and 40 hold-then-place actions. Only valid placements generate afterstates, so invalid actions are naturally excluded without masking.
 
-**Current results (Phase 3, 100k episodes):** Best single game: **1,766 lines**, best reward: **35,401**, avg lines (last 1K): **140** and still climbing.
+**Current results (Phase 3, 101k+ episodes):** Best single game: **1,766 lines** (ep 99,826), best reward: **35,402**, avg lines (last 1K): **117**, 6 games over 1,000 lines. Training ongoing — no plateau observed.
 
 Key design choices:
 - **Afterstate V-learning** — evaluates V(board_after_placement) instead of Q(state, action)

@@ -1,6 +1,6 @@
 # Tetris AI
 
-A placement-based Tetris agent trained with **Afterstate V-learning** (evolved from Dueling Double DQN). The agent evaluates every possible piece placement by simulating the resulting board state and picking the best one. One decision per piece — no frame-by-frame controls.
+A self-taught Tetris agent that clears **1,766 lines in a single game**. Trained with Afterstate V-learning — the agent simulates every possible piece placement, evaluates the resulting board with a CNN, and picks the best move. One decision per piece, no frame-by-frame controls.
 
 ![Demo](assets/demo.gif)
 
@@ -214,26 +214,66 @@ All hyperparameters live in [`config/hyperparams.yaml`](config/hyperparams.yaml)
 
 ## Results
 
-### Phase 3 — Afterstate V-Learning (100k episodes)
+### Best Records (101k+ episodes)
 
 | Metric | Value |
 |--------|-------|
-| Best single game | **1,766 lines** |
-| Best reward | **35,401** |
-| Avg lines (last 1K eps) | **140** |
-| Avg lines (last 10K eps) | 38.7 |
-| Hold rate (learned) | ~32% (down from 50% random) |
+| Best single game | **1,766 lines** (ep 99,826) |
+| Best reward | **35,402** |
+| Games over 1,000 lines | **6** |
+| Avg lines (last 1K eps) | **117** |
+| Avg steps/game (last 1K) | 328 |
+| Hold rate (learned) | ~33% (down from 50% random) |
 
 The agent cleared **501 lines in a single game** during the demo recording above.
 
-### Training Evolution
+### Performance Distribution (last 1,000 episodes)
 
-| Phase | Architecture | Best Lines | Avg Lines | Episodes |
-|-------|-------------|-----------|-----------|----------|
-| Phase 2b | Dueling Double DQN | 100 | 47 | 119k |
-| **Phase 3** | **Afterstate V-learning** | **1,766** | **140** | **100k** |
+| Percentile | Lines Cleared |
+|------------|---------------|
+| Median (p50) | 89 |
+| p90 | 248 |
+| p99 | 508 |
+| Max | 1,203 |
 
-The afterstate architecture delivered a **17.7x improvement** in best game performance and **3x improvement** in average lines compared to the previous Dueling Double DQN approach. Training was still accelerating at session end — no plateau observed.
+### Top 10 Games
+
+| Rank | Episode | Lines | Reward | Steps |
+|------|---------|-------|--------|-------|
+| 1 | 99,826 | **1,766** | 35,402 | 4,446 |
+| 2 | 99,697 | 1,572 | 31,606 | 3,967 |
+| 3 | 99,756 | 1,486 | 28,950 | 3,752 |
+| 4 | 100,342 | 1,203 | 15,319 | 3,046 |
+| 5 | 99,797 | 1,153 | 24,217 | 2,919 |
+| 6 | 99,810 | 1,021 | 21,153 | 2,585 |
+| 7 | 100,002 | 938 | 19,769 | 2,383 |
+| 8 | 99,385 | 923 | 12,152 | 2,349 |
+| 9 | 99,791 | 892 | 19,675 | 2,262 |
+| 10 | 99,999 | 810 | 16,741 | 2,062 |
+
+### Learning Curve
+
+The agent exhibits three distinct learning phases with explosive ignition around episode 90K:
+
+```
+Episodes    Avg Lines   Best Lines   Phase
+─────────   ─────────   ──────────   ─────────────────────
+0 - 80K       0 - 2          13      Slow grind (exploring)
+80K - 90K     3 - 39         39      Acceleration
+90K - 100K    38.7        1,766      Explosive growth
+100K - 101K   118.5       1,203      Sustained high performance
+```
+
+Training is ongoing at 101K+ episodes with no plateau observed.
+
+### Architecture Comparison
+
+| Phase | Architecture | Best Lines | Avg Lines | Improvement |
+|-------|-------------|-----------|-----------|-------------|
+| Phase 2b | Dueling Double DQN | 100 | 47 | baseline |
+| **Phase 3** | **Afterstate V-learning** | **1,766** | **117** | **17.7x best, 2.5x avg** |
+
+The afterstate architecture evaluates V(board_after_placement) instead of Q-values for 80 actions. This eliminates Q-value overestimation, naturally handles invalid actions, and mirrors how SOTA Tetris AI systems work.
 
 ---
 
