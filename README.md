@@ -214,15 +214,15 @@ All hyperparameters live in [`config/hyperparams.yaml`](config/hyperparams.yaml)
 
 ## Results
 
-### Best Records (101k+ episodes)
+### Best Records (102k+ episodes)
 
 | Metric | Value |
 |--------|-------|
 | Best single game | **1,766 lines** (ep 99,826) |
 | Best reward | **35,402** |
-| Games over 1,000 lines | **6** |
-| Avg lines (last 1K eps) | **117** |
-| Avg steps/game (last 1K) | 328 |
+| Games over 1,000 lines | **8** |
+| Avg lines (last 1K eps) | **156** |
+| Avg steps/game (last 1K) | 427 |
 | Hold rate (learned) | ~33% (down from 50% random) |
 
 The agent cleared **501 lines in a single game** during the demo recording above.
@@ -231,10 +231,10 @@ The agent cleared **501 lines in a single game** during the demo recording above
 
 | Percentile | Lines Cleared |
 |------------|---------------|
-| Median (p50) | 89 |
-| p90 | 248 |
-| p99 | 508 |
-| Max | 1,203 |
+| Median (p50) | 112 |
+| p90 | 345 |
+| p99 | 628 |
+| Max | 954 |
 
 ### Top 10 Games
 
@@ -245,11 +245,11 @@ The agent cleared **501 lines in a single game** during the demo recording above
 | 3 | 99,756 | 1,486 | 28,950 | 3,752 |
 | 4 | 100,342 | 1,203 | 15,319 | 3,046 |
 | 5 | 99,797 | 1,153 | 24,217 | 2,919 |
-| 6 | 99,810 | 1,021 | 21,153 | 2,585 |
-| 7 | 100,002 | 938 | 19,769 | 2,383 |
-| 8 | 99,385 | 923 | 12,152 | 2,349 |
-| 9 | 99,791 | 892 | 19,675 | 2,262 |
-| 10 | 99,999 | 810 | 16,741 | 2,062 |
+| 6 | 101,531 | 1,093 | 24,629 | 2,774 |
+| 7 | 101,284 | 1,077 | 29,213 | 2,730 |
+| 8 | 99,810 | 1,021 | 21,153 | 2,585 |
+| 9 | 101,395 | 963 | 24,979 | 2,437 |
+| 10 | 102,282 | 954 | 12,165 | 2,424 |
 
 ### Learning Curve
 
@@ -261,17 +261,17 @@ Episodes    Avg Lines   Best Lines   Phase
 0 - 80K       0 - 2          13      Slow grind (exploring)
 80K - 90K     3 - 39         39      Acceleration
 90K - 100K    38.7        1,766      Explosive growth
-100K - 101K   118.5       1,203      Sustained high performance
+100K - 102K   156         1,203      Sustained high performance
 ```
 
-Training is ongoing at 101K+ episodes with no plateau observed.
+Training is ongoing at 102K+ episodes with no plateau observed.
 
 ### Architecture Comparison
 
 | Phase | Architecture | Best Lines | Avg Lines | Improvement |
 |-------|-------------|-----------|-----------|-------------|
 | Phase 2b | Dueling Double DQN | 100 | 47 | baseline |
-| **Phase 3** | **Afterstate V-learning** | **1,766** | **117** | **17.7x best, 2.5x avg** |
+| **Phase 3** | **Afterstate V-learning** | **1,766** | **156** | **17.7x best, 3.3x avg** |
 
 The afterstate architecture evaluates V(board_after_placement) instead of Q-values for 80 actions. This eliminates Q-value overestimation, naturally handles invalid actions, and mirrors how SOTA Tetris AI systems work.
 
