@@ -195,7 +195,7 @@ def play_ai(
     max_episodes: int = 0,
     watch_fps: int = 30,
 ) -> None:
-    """Run the game with a trained AI agent playing (placement-based).
+    """Run the game with a trained AI agent playing (afterstate-based).
 
     Args:
         config: Config dict loaded from hyperparams.yaml.
@@ -207,7 +207,7 @@ def play_ai(
         raise ImportError("pygame is required for watch mode. Install it: pip install pygame")
 
     from src.env import TetrisEnv
-    from src.ai.agent import DoubleDQNAgent
+    from src.ai.agent import AfterstateAgent
 
     board_width = config.get("board_width", 10)
     board_height = config.get("board_height", 30)
@@ -219,21 +219,17 @@ def play_ai(
     renderer = TetrisRenderer(game, cell_size=cell_size, visible_height=visible_height)
     renderer.render(watch_fps)
 
-    num_rotations = 4
-    place_actions = num_rotations * board_width
-    agent = DoubleDQNAgent(
-        input_channels=4,
+    agent = AfterstateAgent(
+        input_channels=2,
         board_height=20,
         board_width=board_width,
-        num_actions=place_actions * 2,  # 80: place + hold-place
     )
     agent.load(model_path)
 
     running = True
     ep_num = 0
     while running:
-        obs = env.reset()
-        valid_mask = env.get_valid_mask()
+        env.reset()
         done = False
         ep_num += 1
         ep_reward = 0.0
@@ -253,9 +249,13 @@ def play_ai(
             if not running:
                 break
 
-            action = agent.select_action(obs, epsilon=0.0, valid_mask=valid_mask)
-            obs, reward, done, info = env.step(action)
-            valid_mask = info["valid_mask"]
+            afterstates_info = env.get_afterstates()
+            if not afterstates_info:
+                done = True
+                break
+
+            action, _ = agent.select_action(afterstates_info, epsilon=0.0)
+            _, reward, done, info = env.step(action)
             ep_reward += reward
             ep_lines += info.get("lines_cleared", 0)
             ep_steps += 1

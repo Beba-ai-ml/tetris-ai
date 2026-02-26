@@ -31,14 +31,16 @@
 
 ## 1. Project Overview
 
-Tetris AI is a placement-based Tetris agent trained with **Dueling Double DQN**. Instead of frame-by-frame actions (move left, rotate, etc.), the agent chooses where to place each piece — selecting a `(rotation, column)` pair — and the piece is immediately hard-dropped to that position. This eliminates the credit assignment problem inherent in per-frame action spaces: every step produces exactly one piece placement and one immediate reward signal.
+Tetris AI is a placement-based Tetris agent trained with **Afterstate V-learning** (evolved from Dueling Double DQN in Phase 2b). Instead of frame-by-frame actions, the agent simulates every valid piece placement, evaluates the resulting board state with a CNN value network, and picks the best move: `argmax_a [ reward(a) + gamma * V(afterstate(a)) ]`.
 
-The agent operates over an **80-action discrete space**: 40 direct placements and 40 hold-then-place actions. Invalid actions (out-of-bounds positions, unavailable hold) are masked to `-inf` in Q-values before action selection and during target computation.
+The agent operates over an **80-action discrete space**: 40 direct placements and 40 hold-then-place actions. Only valid placements generate afterstates, so invalid actions are naturally excluded without masking.
+
+**Current results (Phase 3, 100k episodes):** Best single game: **1,766 lines**, best reward: **35,401**, avg lines (last 1K): **140** and still climbing.
 
 Key design choices:
-- **Dueling DQN** with asymmetric stride (preserves column resolution in CNN)
-- **Action masking** on both current and next states (prevents learning from impossible actions)
-- **Soft (polyak) target updates** instead of periodic hard copies
+- **Afterstate V-learning** — evaluates V(board_after_placement) instead of Q(state, action)
+- **CNN with asymmetric stride** (preserves column resolution, 2-channel input: board + held piece)
+- **TD(0) with target network** and soft (polyak) updates — no Double DQN needed
 - **Cosine annealing LR with warm restarts** for continued learning at later episodes
 - **Session-based** checkpoint and log organization for multi-run experiments
 
@@ -53,15 +55,15 @@ main.py
   |
   |-- (train mode) --> src/train.py
   |                        |
-  |                        |-- src/env.py (TetrisEnv)
+  |                        |-- src/env.py (TetrisEnv + afterstate generation)
   |                        |       |
   |                        |       |-- src/game/tetris.py (TetrisGame)
   |                        |               |-- src/game/board.py (Board)
   |                        |               |-- src/game/pieces.py (PIECE_TYPES, kick tables)
   |                        |
-  |                        |-- src/ai/agent.py (DoubleDQNAgent)
-  |                                |-- src/ai/model.py (TetrisCNN)  x2 (policy + target)
-  |                                |-- src/ai/replay_buffer.py (ReplayBuffer)
+  |                        |-- src/ai/agent.py (AfterstateAgent)
+  |                                |-- src/ai/model.py (AfterstateNet)  x2 (policy + target)
+  |                                |-- src/ai/replay_buffer.py (AfterstateReplayBuffer)
   |
   |-- (play mode)  --> src/play.py --> src/game/tetris.py + src/renderer.py
   |
@@ -74,28 +76,27 @@ main.py
 env.reset()
     |
     v
-obs: ndarray(4,20,10)  +  valid_mask: ndarray(80,)
-    |
+env.get_afterstates()
+    |  Simulates every valid placement (all rotations x columns x hold/no-hold)
+    |  Returns list of (action, afterstate_obs(2,20,10), immediate_reward)
     v
-agent.select_action(obs, epsilon, valid_mask)
-    |  epsilon-greedy over valid actions; invalid actions masked to -inf in Q-values
+agent.select_action(afterstates_info, epsilon)
+    |  epsilon-greedy: random valid action OR argmax [ reward + gamma * V(afterstate) ]
     v
 action: int (0-79)
     |
     v
 env.step(action)
-    |  if action >= 40: hold first, then decode (rotation, column) from (action-40)
-    |  hard-drop piece, lock, clear lines, spawn next piece
+    |  Execute the chosen placement, clear lines, spawn next piece
     v
-(next_obs, reward, done, info)  -- info["valid_mask"] = mask for next state
+(next_obs, reward, done, info)
     |
     v
-replay_buffer.push(state, action, reward, next_state, done, next_valid_mask)
+replay_buffer.push(afterstate, reward, next_afterstate, done)
     |
     v  (every train_every_n_steps global steps, after warmup)
 agent.train_step(batch_size)
-    |  Double DQN: policy net selects best VALID next action (mask applied)
-    |              target net evaluates that action
+    |  TD(0) V-learning: V(s) -> r + gamma * V_target(s')
     |  Smooth L1 loss, grad clip 1.0, polyak target update (tau=0.002)
     v
 (loss, grad_norm, mean_q, max_q) --> CSV + TensorBoard
@@ -315,20 +316,19 @@ Pygame is initialized lazily on the first call to `render()` so that importing t
 
 ### 3.6 `src/ai/agent.py`
 
-**Purpose:** Dueling Double DQN agent with action masking. Owns two `TetrisCNN` networks (policy and target), the `ReplayBuffer`, and the Adam optimizer. Implements epsilon-greedy action selection and Double DQN target computation with masked next-state actions.
+**Purpose:** Afterstate value agent with TD(0) V-learning. Owns two `AfterstateNet` networks (policy and target), the `AfterstateReplayBuffer`, and the Adam optimizer. Evaluates V(afterstate) for each valid placement and picks the best.
 
-#### Class: `DoubleDQNAgent`
+#### Class: `AfterstateAgent`
 
 ```python
-DoubleDQNAgent(
-    input_channels=4,
+AfterstateAgent(
+    input_channels=2,
     board_height=20,
     board_width=10,
-    num_actions=80,
-    gamma=0.95,
+    gamma=0.97,
     learning_rate=2.5e-4,
-    replay_buffer_size=100_000,
-    tau=0.005,
+    replay_buffer_size=200_000,
+    tau=0.002,
     device="cpu",
 )
 ```
@@ -337,11 +337,11 @@ DoubleDQNAgent(
 
 | Attribute | Type | Description |
 |---|---|---|
-| `policy_net` | `TetrisCNN` | Online network used for action selection and gradient updates. |
-| `target_net` | `TetrisCNN` | Frozen target network updated via polyak averaging. Always in `eval()` mode. |
-| `replay_buffer` | `ReplayBuffer` | Experience replay storage. |
+| `policy_net` | `AfterstateNet` | Online value network for afterstate evaluation and gradient updates. |
+| `target_net` | `AfterstateNet` | Frozen target network updated via polyak averaging. Always in `eval()` mode. |
+| `replay_buffer` | `AfterstateReplayBuffer` | Afterstate transition storage. |
 | `optimizer` | `Adam` | `lr=learning_rate`, `weight_decay=1e-4`. |
-| `loss_fn` | `SmoothL1Loss` | Huber loss for Q-value regression. |
+| `loss_fn` | `SmoothL1Loss` | Huber loss for V-value regression. |
 | `gamma` | `float` | Discount factor. |
 | `tau` | `float` | Polyak averaging coefficient for target net updates. |
 
@@ -349,22 +349,22 @@ DoubleDQNAgent(
 
 | Method | Arguments | Returns | Description |
 |---|---|---|---|
-| `select_action` | `state: ndarray(C,H,W), epsilon: float, valid_mask: ndarray(80,) bool` | `int` | Epsilon-greedy with masking. If `random() < epsilon`, returns a random valid action. Otherwise, sets `policy_net.eval()`, computes Q-values, masks invalid actions to `-inf`, returns `argmax`. Restores `policy_net.train()` after. Falls back to `0` if no valid actions exist. |
-| `train_step` | `batch_size: int` | `(float, float, float, float)` | Samples a batch. Computes current Q-values with `policy_net`. For next states: `policy_net` selects best valid action (masked), `target_net` evaluates it (Double DQN). Computes `target_q = reward + gamma * next_q * (1 - done)`. Backpropagates `SmoothL1Loss`, clips gradients at `max_norm=1.0`, steps optimizer, calls `sync_target_net(hard=False)`. Returns `(loss, grad_norm, mean_q, max_q)`. |
-| `sync_target_net` | `hard: bool = False` | `None` | Hard copy (`load_state_dict`) if `hard=True`. Polyak averaging over all `state_dict` keys (including BatchNorm buffers) if `hard=False`: `θ_target = tau * θ_policy + (1 - tau) * θ_target`. |
-| `save` | `path: str \| Path` | `None` | Saves `{"policy_net": ..., "target_net": ..., "optimizer": ...}` to a `.pt` file. Creates parent directories if needed. |
-| `load` | `path: str \| Path` | `None` | Loads `policy_net`, `target_net`, and `optimizer` state dicts from a checkpoint. Uses `weights_only=True`. |
+| `select_action` | `afterstates_info: list[(action, obs, reward)], epsilon: float` | `(int, afterstate_obs)` | Epsilon-greedy over afterstate values. If `random() < epsilon`, returns a random valid action. Otherwise, evaluates V(afterstate) for each candidate with `policy_net.eval()`, picks `argmax [ reward + gamma * V(afterstate) ]`. Returns chosen action and its afterstate obs. |
+| `train_step` | `batch_size: int` | `(float, float, float, float)` | Samples a batch. Computes V(afterstate) with `policy_net`. Target: `r + gamma * V_target(next_afterstate) * (1 - done)`. Backpropagates `SmoothL1Loss`, clips gradients at `max_norm=1.0`, steps optimizer, calls `sync_target_net(hard=False)`. Returns `(loss, grad_norm, mean_v, max_v)`. |
+| `sync_target_net` | `hard: bool = False` | `None` | Hard copy if `hard=True`. Polyak averaging over all `state_dict` keys (including BatchNorm buffers) if `hard=False`. |
+| `save` | `path: str \| Path` | `None` | Saves `{"policy_net": ..., "target_net": ..., "optimizer": ...}` to a `.pt` file. |
+| `load` | `path: str \| Path` | `None` | Loads state dicts from a checkpoint. Uses `weights_only=True`. |
 
 ---
 
 ### 3.7 `src/ai/model.py`
 
-**Purpose:** Dueling DQN CNN. Accepts a `(batch, 4, 20, 10)` tensor and outputs 80 Q-values using asymmetric stride (compresses height while preserving column resolution).
+**Purpose:** Afterstate value network. Accepts a `(batch, 2, 20, 10)` tensor (board after placement + held piece) and outputs a scalar V(afterstate).
 
-#### Class: `TetrisCNN`
+#### Class: `AfterstateNet`
 
 ```python
-TetrisCNN(input_channels=4, board_height=20, board_width=10, num_actions=80)
+AfterstateNet(input_channels=2, board_height=20, board_width=10)
 ```
 
 Inherits from `nn.Module`.
@@ -373,31 +373,29 @@ Inherits from `nn.Module`.
 
 | Method | Arguments | Returns | Description |
 |---|---|---|---|
-| `__init__` | `input_channels, board_height, board_width, num_actions` | — | Defines `conv_layers`, `value_stream`, `advantage_stream`. Flat size is `64 * (board_height // 4) * board_width = 3200`. |
-| `forward` | `x: Tensor(batch, 4, 20, 10)` | `Tensor(batch, 80)` | Passes input through `conv_layers`, flattens, computes `value` (scalar) and `advantage` (80-dim). Returns `value + advantage - advantage.mean(dim=1, keepdim=True)` (standard dueling formula). |
+| `__init__` | `input_channels, board_height, board_width` | — | Defines `conv_layers` (3x Conv+BN+ReLU with asymmetric stride) and `value_head` (FC→ReLU→FC→scalar). Flat size = `64 * (board_height // 4) * board_width = 3200`. |
+| `forward` | `x: Tensor(batch, 2, 20, 10)` | `Tensor(batch, 1)` | Passes input through `conv_layers`, flattens, returns `value_head(flat)` — a scalar V(afterstate). |
 
 ---
 
 ### 3.8 `src/ai/replay_buffer.py`
 
-**Purpose:** Pre-allocated circular replay buffer storing `(state, action, reward, next_state, done, next_valid_mask)`. Uses `uint8` numpy arrays for memory efficiency (states are binarized float32 observations cast to `uint8`). Stores the `next_valid_mask` alongside each transition so target Q-values can be masked during training.
+**Purpose:** Pre-allocated circular replay buffer storing afterstate transitions `(afterstate, reward, next_afterstate, done)`. Uses `uint8` numpy arrays for memory efficiency (afterstates are binarized float32 observations cast to `uint8`).
 
-#### Class: `ReplayBuffer`
+#### Class: `AfterstateReplayBuffer`
 
 ```python
-ReplayBuffer(capacity: int, obs_shape: tuple = (4, 20, 10), num_actions: int = 80)
+AfterstateReplayBuffer(capacity: int, obs_shape: tuple = (2, 20, 10))
 ```
 
 **Instance attributes:**
 
 | Attribute | dtype | Shape | Description |
 |---|---|---|---|
-| `states` | `uint8` | `(capacity, 4, 20, 10)` | Stored observations (binarized to 0/1). |
-| `next_states` | `uint8` | `(capacity, 4, 20, 10)` | Next observations. |
-| `actions` | `int64` | `(capacity,)` | Chosen action indices. |
-| `rewards` | `float32` | `(capacity,)` | Shaped rewards. |
+| `states` | `uint8` | `(capacity, 2, 20, 10)` | Afterstate observations (board after placement + held piece). |
+| `next_states` | `uint8` | `(capacity, 2, 20, 10)` | Next afterstate observations. |
+| `rewards` | `float32` | `(capacity,)` | Immediate rewards. |
 | `dones` | `float32` | `(capacity,)` | Episode termination flags (0.0 or 1.0). |
-| `next_masks` | `uint8` | `(capacity, 80)` | Valid action masks for next states. |
 | `pos` | `int` | — | Current write position (circular). |
 | `size` | `int` | — | Current number of stored transitions (capped at `capacity`). |
 
@@ -405,8 +403,8 @@ ReplayBuffer(capacity: int, obs_shape: tuple = (4, 20, 10), num_actions: int = 8
 
 | Method | Arguments | Returns | Description |
 |---|---|---|---|
-| `push` | `state, action, reward, next_state, done, next_valid_mask` | `None` | Writes one transition at `pos`, advances `pos` modulo `capacity`, increments `size` up to `capacity`. Casts states to `uint8`. |
-| `sample` | `batch_size: int, device: str \| device` | `tuple[Tensor, ...]` | Samples `batch_size` transitions without replacement. Converts `uint8` arrays to `float32` tensors for `states` and `next_states`. Converts `next_masks` to `bool`. Returns `(states, actions, rewards, next_states, dones, next_masks)` on the specified device. |
+| `push` | `state, reward, next_state, done` | `None` | Writes one transition at `pos`, advances `pos` modulo `capacity`, increments `size` up to `capacity`. Casts states to `uint8`. |
+| `sample` | `batch_size: int, device: str \| device` | `tuple[Tensor, ...]` | Samples `batch_size` transitions without replacement. Converts `uint8` to `float32` tensors. Returns `(states, rewards, next_states, dones)` on the specified device. |
 | `__len__` | — | `int` | Returns `self.size`. |
 
 ---
@@ -608,15 +606,15 @@ Masking is applied in two places:
 
 ## 5. Model Architecture
 
-**Class:** `TetrisCNN` in `src/ai/model.py`
+**Class:** `AfterstateNet` in `src/ai/model.py`
 
-**Input:** `(batch, 4, 20, 10)` float32 tensor
+**Input:** `(batch, 2, 20, 10)` float32 tensor — board after placement + held piece
 
 ### Convolutional Backbone
 
 | Layer | Type | In channels | Out channels | Kernel | Padding | Stride | Output shape |
 |---|---|---|---|---|---|---|---|
-| Conv1 | `Conv2d` + `BatchNorm2d` + `ReLU` | 4 | 32 | 3×3 | 1 | (1,1) | (batch, 32, 20, 10) |
+| Conv1 | `Conv2d` + `BatchNorm2d` + `ReLU` | 2 | 32 | 3×3 | 1 | (1,1) | (batch, 32, 20, 10) |
 | Conv2 | `Conv2d` + `BatchNorm2d` + `ReLU` | 32 | 64 | 3×3 | 1 | **(2,1)** | (batch, 64, 10, 10) |
 | Conv3 | `Conv2d` + `BatchNorm2d` + `ReLU` | 64 | 64 | 3×3 | 1 | **(2,1)** | (batch, 64, 5, 10) |
 
@@ -624,31 +622,24 @@ Masking is applied in two places:
 
 **Flatten:** `64 × 5 × 10 = 3200`
 
-### Dueling Streams
+### Value Head
 
-Both streams receive the same 3200-dim flat vector.
+Single scalar output — no dueling decomposition (meaningless with one output).
 
-| Stream | Layers | Output |
+| Head | Layers | Output |
 |---|---|---|
-| Value | `Linear(3200, 512)` → `ReLU` → `Linear(512, 1)` | Scalar state value `V(s)` |
-| Advantage | `Linear(3200, 512)` → `ReLU` → `Linear(512, 80)` | Per-action advantage `A(s,a)` for all 80 actions |
+| Value | `Linear(3200, 512)` → `ReLU` → `Linear(512, 1)` | Scalar `V(afterstate)` |
 
-**Dueling formula:**
-```
-Q(s,a) = V(s) + A(s,a) - mean_a(A(s,a))
-```
+**Action selection:** The agent doesn't use the network for action selection directly. Instead, it simulates every valid placement via `env.get_afterstates()`, evaluates each resulting board state, and picks: `argmax_a [ reward(a) + gamma * V(afterstate(a)) ]`.
 
-Subtracting the mean advantage over all actions centers the advantage estimates and prevents the value and advantage streams from being individually unidentifiable.
-
-**Note:** No Dropout layers exist in the current implementation. Dropout was removed during the Phase 2 bugfix (it caused inference/training distribution mismatch with `BatchNorm`).
+**No Dropout, no masked advantage.** Weight decay (L2=1e-4) provides regularization.
 
 ### Parameter Count
 
 Approximate:
-- Conv backbone: ~370K parameters
-- Value stream: ~1.6M parameters
-- Advantage stream: ~1.7M parameters
-- **Total: ~3.7M parameters**
+- Conv backbone: ~370K parameters (2-channel input vs 4-channel saves ~600 params in Conv1)
+- Value head: ~1.6M parameters
+- **Total: ~2.0M parameters** (down from ~3.7M in the old Dueling DQN)
 
 ---
 
@@ -659,7 +650,7 @@ Approximate:
 1. Device is set to CUDA if available, otherwise CPU.
 2. Session directory is created at `checkpoints/session_{session_id}/`.
 3. `TetrisEnv` is instantiated with all reward weights from config.
-4. `DoubleDQNAgent` is instantiated. `target_net` is hard-synced from `policy_net` at startup and set to `eval()`.
+4. `AfterstateAgent` is instantiated. `target_net` is hard-synced from `policy_net` at startup and set to `eval()`.
 5. `CosineAnnealingWarmRestarts` scheduler is created with `T_0=lr_cycle_episodes` (50000) and `eta_min=min_learning_rate` (1e-5).
 6. `SummaryWriter` is created at `runs/session_{session_id}/` (skipped if TensorBoard is not installed).
 7. `CSVLogger` is started at `checkpoints/session_{session_id}/session_{session_id}.csv`.
@@ -672,16 +663,17 @@ Before any gradient updates, the loop runs with `epsilon=1.0` (pure random explo
 
 For each episode:
 
-1. `env.reset()` → initial `state` and `valid_mask`.
+1. `env.reset()` → initial board state.
 2. `epsilon = get_epsilon(episode, config)` (linear decay, overridden to `1.0` during warmup).
 3. Inner loop (up to `max_steps_per_episode=5000`):
-   - `agent.select_action(state, epsilon, valid_mask)` → `action`
-   - `env.step(action)` → `(next_state, reward, done, info)`
-   - `replay_buffer.push(state, action, reward, next_state, done, info["valid_mask"])`
+   - `env.get_afterstates()` → list of `(action, afterstate_obs, immediate_reward)` for all valid placements
+   - `agent.select_action(afterstates_info, epsilon)` → `action` (epsilon-greedy over afterstate values)
+   - `env.step(action)` → `(next_obs, reward, done, info)`
+   - `replay_buffer.push(afterstate, reward, next_afterstate, done)`
    - Every `train_every_n_steps=4` global steps (after warmup): `agent.train_step(batch_size=256)`
    - `global_step += 1`
 4. After episode: `scheduler.step(episode % lr_cycle)`.
-5. Log to TensorBoard and CSV (averages of loss, grad_norm, mean_q, max_q over the episode).
+5. Log to TensorBoard and CSV (averages of loss, grad_norm, mean_v, max_v over the episode).
 6. Checkpoint if `episode % save_freq == 0` (500) or if `episode_reward > best_reward`.
 
 ### Epsilon Decay

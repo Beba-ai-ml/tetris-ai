@@ -1,5 +1,5 @@
 """
-Placement-based Tetris environment for RL.
+Placement-based Tetris environment for RL with afterstate evaluation.
 
 Instead of per-frame actions (move/rotate), the agent chooses WHERE to place
 each piece: (rotation, column). The piece is instantly hard-dropped to that
@@ -8,13 +8,10 @@ position. One decision per piece = immediate reward = no credit assignment probl
 Action space: 80 discrete actions.
   Actions 0-39:  Place current piece at (rotation, column).
   Actions 40-79: HOLD first, then place the resulting piece at (rotation, column).
-Invalid placements (out of bounds or hold unavailable) are masked to -inf in Q-values.
 
-Observation: (4, 20, 10) per state — no frame stacking needed.
-  Ch0: Board grid (binary)
-  Ch1: Current piece shape (top-left corner)
-  Ch2: Next piece shape (top-left corner)
-  Ch3: Held piece shape (top-left corner, zeros if None)
+Afterstate observation: (2, 20, 10) — board after placement + held piece.
+  Ch0: Board grid after placement + line clear (binary)
+  Ch1: Held piece shape (top-left corner, zeros if None)
 """
 
 from __future__ import annotations
@@ -23,6 +20,7 @@ from typing import Any
 
 import numpy as np
 
+from src.game.board import Board
 from src.game.tetris import TetrisGame
 
 
@@ -328,3 +326,126 @@ class TetrisEnv:
             "bumpiness": self._prev_bumpiness,
             "valid_mask": valid_mask,
         }
+
+    # ── Afterstate Methods ────────────────────────────────────────────────
+
+    def get_current_afterstate_obs(self) -> np.ndarray:
+        """Build afterstate obs from current board state (after step / after reset)."""
+        return self._build_afterstate_obs(self.game.board.grid, self.game.held_piece)
+
+    def get_afterstates(self) -> list[tuple[int, np.ndarray, float]]:
+        """Enumerate all valid placements, simulate each, return afterstate info.
+
+        For each valid action:
+          1. Copy the board grid
+          2. Simulate piece placement (hard drop + lock + line clear)
+          3. Compute immediate reward from delta metrics
+          4. Build 2-channel afterstate observation
+
+        Returns:
+            List of (action_idx, afterstate_obs, immediate_reward).
+        """
+        mask = self.get_valid_mask()
+        pre_holes, pre_height, pre_bump = self._get_board_metrics()
+        results = []
+
+        for action_idx in np.where(mask)[0]:
+            temp_board, lines, new_holes, held_after = self._simulate_placement(
+                int(action_idx)
+            )
+
+            post_holes = temp_board.get_holes()
+            post_height = temp_board.get_aggregate_height()
+            post_bump = temp_board.get_bumpiness()
+
+            reward = calculate_reward(
+                lines_cleared=lines,
+                holes_delta=post_holes - pre_holes,
+                height_delta=post_height - pre_height,
+                bumpiness_delta=post_bump - pre_bump,
+                game_over=False,
+                piece_locked=True,
+                new_holes_from_lock=new_holes,
+                **self._reward_params,
+            )
+
+            obs = self._build_afterstate_obs(temp_board.grid, held_after)
+            results.append((int(action_idx), obs, reward))
+
+        return results
+
+    def _simulate_placement(
+        self, action_idx: int
+    ) -> tuple[Board, int, int, dict | None]:
+        """Simulate a single placement without mutating env/game state.
+
+        Creates a temporary Board copy, places the appropriate piece
+        (handling hold logic), hard drops, locks, and clears lines.
+
+        Args:
+            action_idx: Action index 0-79.
+
+        Returns:
+            (temp_board, lines_cleared, new_holes, held_piece_after)
+        """
+        temp_board = Board(self.board_width, self.board_height)
+        temp_board.grid = self.game.board.grid.copy()
+
+        is_hold = action_idx >= self._place_actions
+        local_action = action_idx % self._place_actions
+        rotation = local_action // self.board_width
+        column = local_action % self.board_width
+
+        if is_hold:
+            if self.game.held_piece is not None:
+                piece = self.game.held_piece
+            else:
+                piece = self.game.next_piece
+            held_after = self.game.current_piece
+        else:
+            piece = self.game.current_piece
+            held_after = self.game.held_piece
+
+        # Hard drop: find lowest valid y
+        shape = piece["rotations"][rotation]
+        piece_height = shape.shape[0]
+        y = self._buffer_rows - piece_height + 1
+        while temp_board.is_valid_position(piece, column, y + 1, rotation):
+            y += 1
+
+        # Lock piece and clear lines
+        holes_before = temp_board.get_holes()
+        temp_board.place_piece(piece, column, y, rotation)
+        lines = temp_board.clear_lines()
+        new_holes = max(0, temp_board.get_holes() - holes_before)
+
+        return temp_board, lines, new_holes, held_after
+
+    def _build_afterstate_obs(
+        self, board_grid: np.ndarray, held_piece: dict | None
+    ) -> np.ndarray:
+        """Build 2-channel afterstate observation.
+
+        Ch0: Board grid after placement (binary, visible rows only)
+        Ch1: Held piece shape (top-left corner, zeros if None)
+
+        Args:
+            board_grid: Full board grid (height x width).
+            held_piece: Held piece dict or None.
+
+        Returns:
+            Float32 array of shape (2, 20, 10).
+        """
+        h = self.VISIBLE_HEIGHT
+        w = self.board_width
+        buf = self._buffer_rows
+        obs = np.zeros((2, h, w), dtype=np.float32)
+
+        obs[0] = (board_grid[buf : buf + h] != 0).astype(np.float32)
+
+        if held_piece is not None:
+            shape = held_piece["rotations"][0]
+            rows, cols = shape.shape
+            obs[1, :rows, :cols] = (shape != 0).astype(np.float32)
+
+        return obs

@@ -16,17 +16,17 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from src.env import TetrisEnv
-from src.ai.agent import DoubleDQNAgent
+from src.ai.agent import AfterstateAgent
 from src.game.pieces import PIECE_TYPES
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-MODEL_PATH = PROJECT_ROOT / "checkpoints" / "session_phase2b" / "best_model.pt"
+MODEL_PATH = PROJECT_ROOT / "checkpoints" / "session_phase3_afterstate" / "best_model.pt"
 OUTPUT_PATH = PROJECT_ROOT / "assets" / "demo.gif"
-MIN_TOTAL_LINES = 80
-TARGET_FPS = 24
-FRAME_DURATION_MS = 1000 // TARGET_FPS  # ~41ms per frame
+MIN_TOTAL_LINES = 500
+TARGET_FPS = 48
+FRAME_DURATION_MS = 1000 // TARGET_FPS  # ~20ms per frame
 
 # Visual settings
 CELL_SIZE = 24
@@ -234,9 +234,9 @@ def main():
 
     # Setup
     env = TetrisEnv(board_width=10, board_height=30)
-    agent = DoubleDQNAgent(
-        input_channels=4, board_height=20, board_width=10,
-        num_actions=80, device="cpu"
+    agent = AfterstateAgent(
+        input_channels=2, board_height=20, board_width=10,
+        device="cpu"
     )
     agent.load(str(MODEL_PATH))
     agent.policy_net.eval()
@@ -248,8 +248,7 @@ def main():
     max_episodes = 50  # Safety cap
 
     while total_lines < MIN_TOTAL_LINES and episode < max_episodes:
-        obs = env.reset()
-        mask = env.get_valid_mask()
+        env.reset()
         done = False
         episode += 1
         ep_lines = 0
@@ -259,9 +258,12 @@ def main():
 
         step_count = 0
         while not done:
-            action = agent.select_action(obs, epsilon=0.0, valid_mask=mask)
-            obs, reward, done, info = env.step(action)
-            mask = info["valid_mask"]
+            afterstates_info = env.get_afterstates()
+            if not afterstates_info:
+                done = True
+                break
+            action, _ = agent.select_action(afterstates_info, epsilon=0.0)
+            _, reward, done, info = env.step(action)
             lines_this_step = info["lines_cleared"]
             ep_lines += lines_this_step
             total_lines += lines_this_step

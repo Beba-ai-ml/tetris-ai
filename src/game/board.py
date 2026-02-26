@@ -129,15 +129,10 @@ class Board:
         Returns:
             Total number of holes across all columns.
         """
-        holes = 0
-        for col in range(self.width):
-            found_block = False
-            for row in range(self.height):
-                if self.grid[row, col] != 0:
-                    found_block = True
-                elif found_block:
-                    holes += 1
-        return holes
+        filled = self.grid != 0
+        block_above = np.maximum.accumulate(filled, axis=0)
+        holes = block_above & ~filled
+        return int(holes.sum())
 
     def get_aggregate_height(self) -> int:
         """Calculate the sum of the heights of all columns.
@@ -148,7 +143,7 @@ class Board:
         Returns:
             Sum of all column heights.
         """
-        return sum(self.get_column_heights())
+        return int(self.get_column_heights().sum())
 
     def get_bumpiness(self) -> int:
         """Calculate the bumpiness of the board surface.
@@ -160,29 +155,21 @@ class Board:
             Total bumpiness value.
         """
         heights = self.get_column_heights()
-        bumpiness = 0
-        for i in range(len(heights) - 1):
-            bumpiness += abs(heights[i] - heights[i + 1])
-        return bumpiness
+        return int(np.abs(np.diff(heights)).sum())
 
-    def get_column_heights(self) -> list[int]:
-        """Get the height of every column.
+    def get_column_heights(self) -> np.ndarray:
+        """Get the height of every column (vectorized).
 
         A column's height is measured from the bottom of the board (row
         height-1) up to the topmost filled cell. An empty column has height 0.
 
         Returns:
-            List of ints with length equal to board width.
+            Numpy array of ints with length equal to board width.
         """
-        heights = []
-        for col in range(self.width):
-            height = 0
-            for row in range(self.height):
-                if self.grid[row, col] != 0:
-                    height = self.height - row
-                    break
-            heights.append(height)
-        return heights
+        filled = self.grid != 0
+        has_block = filled.any(axis=0)
+        first_block = np.argmax(filled, axis=0)
+        return np.where(has_block, self.height - first_block, 0)
 
     def is_game_over(self) -> bool:
         """Determine whether the game is over.

@@ -1,13 +1,13 @@
 """
-Training loop for placement-based Dueling Double DQN Tetris agent.
+Training loop for afterstate V-learning Tetris agent.
 
 Features:
-  - Placement-based action space with hold (80 actions: 40 place + 40 hold-place)
-  - Invalid action masking (out-of-bounds placements → -inf Q-value)
+  - Afterstate evaluation: V(s') for each valid placement
+  - TD(0) V-learning with target network (polyak averaging)
   - Cosine annealing LR with warm restarts
-  - Soft target updates (polyak averaging)
   - CSV + TensorBoard logging
   - Session-based checkpoint/log organization
+  - Hold usage tracking for monitoring
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ except ImportError:
     SummaryWriter = None  # type: ignore[assignment, misc]
 
 from src.env import TetrisEnv
-from src.ai.agent import DoubleDQNAgent
+from src.ai.agent import AfterstateAgent
 
 
 # ── CSV Logger ───────────────────────────────────────────────────────────────
@@ -40,10 +40,11 @@ CSV_FIELDNAMES = [
     "epsilon",
     "loss",
     "grad_norm",
-    "mean_q",
-    "max_q",
+    "mean_v",
+    "max_v",
     "lr",
     "best_reward",
+    "hold_rate",
 ]
 
 
@@ -100,7 +101,18 @@ def train(
     resume_path: str | None = None,
     session_id: str = "default",
 ) -> None:
-    """Run the full training loop (runs indefinitely until Ctrl+C)."""
+    """Run the full training loop (runs indefinitely until Ctrl+C).
+
+    Uses afterstate V-learning: for each step, enumerate all valid placements,
+    simulate each, evaluate V(afterstate) with the network, and pick the action
+    with highest immediate_reward + gamma * V(afterstate).
+
+    Replay buffer stores (afterstate, reward, next_afterstate, done) using
+    a delayed push pattern:
+      V(AS_t) = E[r_{t+1} + gamma * V(AS_{t+1})]
+    The reward stored with AS_t is from the NEXT placement (the one that
+    created AS_{t+1}), not from the placement that created AS_t.
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     print(f"Session: {session_id}")
@@ -166,31 +178,54 @@ def train(
     try:
         while True:
             state = env.reset()
-            valid_mask = env.get_valid_mask()
             episode_reward = 0.0
             episode_lines = 0
             episode_steps = 0
+            episode_holds = 0
             episode_losses: list[float] = []
             episode_grad_norms: list[float] = []
-            episode_mean_qs: list[float] = []
-            episode_max_qs: list[float] = []
+            episode_mean_vs: list[float] = []
+            episode_max_vs: list[float] = []
             done = False
 
             epsilon = get_epsilon(episode, config)
             if not warmup_done:
                 epsilon = 1.0
 
-            while not done and episode_steps < max_steps:
-                action = agent.select_action(state, epsilon, valid_mask)
-                next_state, reward, done, info = env.step(action)
-                next_valid_mask = info["valid_mask"]
+            # Initial afterstate: empty board from reset (before any placement)
+            prev_afterstate = env.get_current_afterstate_obs()
 
-                agent.replay_buffer.push(
-                    state, action, reward, next_state, done, next_valid_mask
+            while not done and episode_steps < max_steps:
+                # Enumerate and evaluate all valid afterstates
+                afterstates_info = env.get_afterstates()
+
+                if not afterstates_info:
+                    # No valid actions — game over
+                    done = True
+                    break
+
+                # Select action
+                action, chosen_afterstate = agent.select_action(
+                    afterstates_info, epsilon
                 )
 
+                # Track hold usage
+                if action >= env._place_actions:
+                    episode_holds += 1
+
+                # Execute action
+                next_state, reward, done, info = env.step(action)
+
+                # Afterstate TD(0) delayed push:
+                # V(prev_AS) → reward + gamma * V(chosen_AS)
+                # The reward here is from THIS placement (the one that transitions
+                # us from prev_afterstate to chosen_afterstate).
+                agent.replay_buffer.push(
+                    prev_afterstate, reward, chosen_afterstate, done
+                )
+
+                prev_afterstate = chosen_afterstate
                 state = next_state
-                valid_mask = next_valid_mask
                 episode_reward += reward
                 episode_lines += info.get("lines_cleared", 0)
                 episode_steps += 1
@@ -200,11 +235,11 @@ def train(
                     print(f"Warmup complete ({len(agent.replay_buffer)} transitions). Training starts.")
 
                 if warmup_done and global_step % train_every_n_steps == 0:
-                    loss, grad_norm, mean_q, max_q = agent.train_step(batch_size)
+                    loss, grad_norm, mean_v, max_v = agent.train_step(batch_size)
                     episode_losses.append(loss)
                     episode_grad_norms.append(grad_norm)
-                    episode_mean_qs.append(mean_q)
-                    episode_max_qs.append(max_q)
+                    episode_mean_vs.append(mean_v)
+                    episode_max_vs.append(max_v)
 
                 global_step += 1
 
@@ -214,14 +249,15 @@ def train(
             # Compute averages
             avg_loss = float(np.mean(episode_losses)) if episode_losses else 0.0
             avg_grad_norm = float(np.mean(episode_grad_norms)) if episode_grad_norms else 0.0
-            avg_mean_q = float(np.mean(episode_mean_qs)) if episode_mean_qs else 0.0
-            avg_max_q = float(np.mean(episode_max_qs)) if episode_max_qs else 0.0
+            avg_mean_v = float(np.mean(episode_mean_vs)) if episode_mean_vs else 0.0
+            avg_max_v = float(np.mean(episode_max_vs)) if episode_max_vs else 0.0
             current_lr = scheduler.get_last_lr()[0]
+            hold_rate = episode_holds / max(episode_steps, 1)
 
             # TensorBoard
             _log_tb(writer, episode, episode_reward, episode_lines,
                     epsilon, avg_loss, episode_steps, avg_grad_norm, current_lr,
-                    avg_mean_q, avg_max_q)
+                    avg_mean_v, avg_max_v, hold_rate)
 
             # CSV
             csv_logger.write({
@@ -232,10 +268,11 @@ def train(
                 "epsilon": f"{epsilon:.4f}",
                 "loss": f"{avg_loss:.6f}",
                 "grad_norm": f"{avg_grad_norm:.4f}",
-                "mean_q": f"{avg_mean_q:.4f}",
-                "max_q": f"{avg_max_q:.4f}",
+                "mean_v": f"{avg_mean_v:.4f}",
+                "max_v": f"{avg_max_v:.4f}",
                 "lr": f"{current_lr:.2e}",
                 "best_reward": f"{best_reward:.2f}",
+                "hold_rate": f"{hold_rate:.4f}",
             })
 
             # Checkpoints — saved inside session dir
@@ -252,7 +289,8 @@ def train(
                     f"Episode {episode} | "
                     f"Reward: {episode_reward:.1f} | Lines: {episode_lines} | "
                     f"Epsilon: {epsilon:.3f} | Steps: {episode_steps} | "
-                    f"Loss: {avg_loss:.4f} | LR: {current_lr:.2e}"
+                    f"Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | "
+                    f"Hold: {hold_rate:.2f}"
                     + (f" | {phase}" if phase else "")
                 )
 
@@ -268,21 +306,16 @@ def train(
     print(f"Training stopped at episode {episode}. Best reward: {best_reward:.1f}")
 
 
-def _create_agent(config: dict[str, Any], device: str) -> DoubleDQNAgent:
-    """Instantiate agent from config."""
-    board_width = config.get("board_width", 10)
-    num_rotations = 4
-    place_actions = num_rotations * board_width
-    num_actions = place_actions * 2  # 80
-    return DoubleDQNAgent(
-        input_channels=4,
+def _create_agent(config: dict[str, Any], device: str) -> AfterstateAgent:
+    """Instantiate afterstate agent from config."""
+    return AfterstateAgent(
+        input_channels=2,
         board_height=20,
-        board_width=board_width,
-        num_actions=num_actions,
-        gamma=config.get("gamma", 0.95),
+        board_width=config.get("board_width", 10),
+        gamma=config.get("gamma", 0.97),
         learning_rate=config.get("learning_rate", 2.5e-4),
-        replay_buffer_size=config.get("replay_buffer_size", 100_000),
-        tau=config.get("tau", 0.005),
+        replay_buffer_size=config.get("replay_buffer_size", 200_000),
+        tau=config.get("tau", 0.002),
         device=device,
     )
 
@@ -297,8 +330,9 @@ def _log_tb(
     length: int,
     grad_norm: float = 0.0,
     lr: float = 0.0,
-    mean_q: float = 0.0,
-    max_q: float = 0.0,
+    mean_v: float = 0.0,
+    max_v: float = 0.0,
+    hold_rate: float = 0.0,
 ) -> None:
     """Log episode metrics to TensorBoard."""
     if writer is None:
@@ -310,12 +344,13 @@ def _log_tb(
     writer.add_scalar("Steps/episode", length, episode)
     writer.add_scalar("GradNorm/episode", grad_norm, episode)
     writer.add_scalar("LearningRate", lr, episode)
-    writer.add_scalar("QValues/mean", mean_q, episode)
-    writer.add_scalar("QValues/max", max_q, episode)
+    writer.add_scalar("VValues/mean", mean_v, episode)
+    writer.add_scalar("VValues/max", max_v, episode)
+    writer.add_scalar("HoldRate/episode", hold_rate, episode)
 
 
 def _save_checkpoint(
-    agent: DoubleDQNAgent,
+    agent: AfterstateAgent,
     session_dir: str | pathlib.Path,
     episode: int,
     global_step: int = 0,

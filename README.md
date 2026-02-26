@@ -1,6 +1,6 @@
 # Tetris AI
 
-A placement-based Tetris agent trained with Dueling Double DQN, action masking, and hold mechanics. The agent learns to play Tetris by choosing where to place each piece (rotation + column) rather than issuing frame-by-frame movement commands.
+A placement-based Tetris agent trained with **Afterstate V-learning** (evolved from Dueling Double DQN). The agent evaluates every possible piece placement by simulating the resulting board state and picking the best one. One decision per piece — no frame-by-frame controls.
 
 ![Demo](assets/demo.gif)
 
@@ -8,13 +8,13 @@ A placement-based Tetris agent trained with Dueling Double DQN, action masking, 
 
 ## Key Features
 
+- **Afterstate V-learning** -- evaluates V(board_after_placement) for every valid move, picks the best
 - **Placement-based action space** -- 80 discrete actions (4 rotations x 10 columns x 2 modes: place / hold-then-place)
-- **Dueling Double DQN** with BatchNorm CNN backbone
-- **Invalid action masking** -- out-of-bounds placements get `-inf` Q-values, so the agent never picks illegal moves
-- **Hold mechanic** -- agent can strategically swap the current piece for a held one
+- **CNN value network** with BatchNorm and asymmetric stride (preserves column resolution)
+- **Hold mechanic** -- agent strategically swaps pieces to optimize placement
 - **SRS rotation system** with full wall-kick tables (standard Tetris Guideline)
 - **7-bag randomizer** for fair piece distribution
-- **Reward shaping** -- line clears, hole penalty, height penalty, bumpiness penalty, clean placement bonus
+- **Reward shaping** -- line clears, hole/height/bumpiness penalties, clean placement bonus
 - **Cosine annealing LR** with warm restarts
 
 ---
@@ -24,14 +24,14 @@ A placement-based Tetris agent trained with Dueling Double DQN, action masking, 
 ```
 main.py                         CLI entry point (train / play / watch)
     |
-src/env.py                      Placement-based RL environment (80 actions)
+src/env.py                      Placement-based RL environment (80 actions, afterstate generation)
     |
 src/game/tetris.py              Game engine (scoring, gravity, SRS, 7-bag)
 src/game/board.py               Board logic (collision, line clearing, metrics)
 src/game/pieces.py              Tetromino definitions + SRS kick tables
     |
-src/ai/model.py                 Dueling DQN CNN (4ch input -> 80 Q-values)
-src/ai/agent.py                 Double DQN agent (action masking, soft target updates)
+src/ai/model.py                 AfterstateNet CNN (2ch input -> scalar V(s'))
+src/ai/agent.py                 Afterstate value agent (TD(0) V-learning, polyak target updates)
 src/ai/replay_buffer.py         Pre-allocated circular replay buffer
     |
 src/train.py                    Training loop (CSV + TensorBoard logging)
@@ -39,26 +39,24 @@ src/play.py                     Manual play + AI watch modes (pygame)
 src/renderer.py                 Pygame renderer (board, ghost piece, sidebar)
 ```
 
-### Network Architecture
+### Network Architecture (Afterstate V-Network)
 
 ```
-Input: (batch, 4, 20, 10)
-  Ch0: Board grid (binary)
-  Ch1: Current piece shape
-  Ch2: Next piece shape
-  Ch3: Held piece shape
+Input: (batch, 2, 20, 10)
+  Ch0: Board grid AFTER placement + line clear (binary)
+  Ch1: Held piece shape (zeros if None)
 
-  -> Conv2d(4->32, 3x3) + BN + ReLU
-  -> Conv2d(32->64, 3x3, stride=(2,1)) + BN + ReLU
+  -> Conv2d(2->32, 3x3) + BN + ReLU
+  -> Conv2d(32->64, 3x3, stride=(2,1)) + BN + ReLU   # compress height, keep width
   -> Conv2d(64->64, 3x3, stride=(2,1)) + BN + ReLU
   -> Flatten (3200)
-  -> Dueling heads:
-       Value:     Linear(3200->512) -> ReLU -> Linear(512->1)
-       Advantage: Linear(3200->512) -> ReLU -> Linear(512->80)
-  -> Q = V + (A - mean(A))
+  -> Linear(3200->512) -> ReLU -> Linear(512->1)
 
-Output: 80 Q-values
+Output: scalar V(afterstate)
 ```
+
+The agent simulates every valid placement, evaluates V(resulting board), and picks:
+`argmax_a [ reward(a) + gamma * V(afterstate(a)) ]`
 
 ---
 
@@ -99,7 +97,7 @@ tensorboard --logdir runs/
 ## Watch AI Play
 
 ```bash
-python3 main.py --mode watch --model checkpoints/session_phase2b/best_model.pt
+python3 main.py --mode watch --model checkpoints/session_phase3_afterstate/best_model.pt
 ```
 
 Options:
@@ -139,8 +137,8 @@ tetris-ai/
       board.py                 Board logic (collision, line clearing)
       pieces.py                Tetromino shapes + SRS kick tables
     ai/
-      model.py                 Dueling DQN CNN
-      agent.py                 Double DQN agent with action masking
+      model.py                 AfterstateNet CNN (V-learning)
+      agent.py                 Afterstate value agent (TD(0))
       replay_buffer.py         Circular replay buffer
   scripts/
     record_gif.py              Record demo GIF (PIL-based, no pygame)
@@ -163,12 +161,13 @@ Instead of per-frame controls (left, right, rotate, drop), the agent makes one d
 
 The piece is instantly hard-dropped to the chosen position. This eliminates the credit assignment problem of multi-step placement.
 
-### Dueling Double DQN with Action Masking
+### Afterstate V-Learning
 
-- **Double DQN**: Policy net selects the best action, target net evaluates it -- reduces overestimation bias
-- **Dueling architecture**: Separate value and advantage streams -- learns state value independently of action advantages
-- **Action masking**: Invalid placements (piece doesn't fit at that rotation+column) are masked to `-inf` before argmax, so the agent only considers legal moves
+- **Afterstate evaluation**: For each valid placement, simulate the result (lock piece, clear lines), then evaluate V(resulting board) with a CNN
+- **Action selection**: Pick the action maximizing `reward(a) + gamma * V(afterstate(a))` -- no Q-value overestimation problem
+- **TD(0) V-learning**: Train the value network to predict `V(s) = r + gamma * V(s')` using target network for stability
 - **Soft target updates**: Polyak averaging (`tau=0.002`) for stable learning
+- **No action masking needed**: Only valid placements generate afterstates, so invalid actions are naturally excluded
 
 ### Reward Shaping
 
@@ -215,17 +214,26 @@ All hyperparameters live in [`config/hyperparams.yaml`](config/hyperparams.yaml)
 
 ## Results
 
-After 110,000 episodes of training (Phase 2b):
+### Phase 3 — Afterstate V-Learning (100k episodes)
 
 | Metric | Value |
 |--------|-------|
-| Avg lines per game (last 1K eps) | 26.3 |
-| Median lines per game | 24 |
-| Best single game | 100 lines |
-| Best reward | 3,009.5 |
-| Games with 10+ lines | 87% |
-| Games with 20+ lines | 61% |
-| Games with 50+ lines | 9% |
+| Best single game | **1,766 lines** |
+| Best reward | **35,401** |
+| Avg lines (last 1K eps) | **140** |
+| Avg lines (last 10K eps) | 38.7 |
+| Hold rate (learned) | ~32% (down from 50% random) |
+
+The agent cleared **501 lines in a single game** during the demo recording above.
+
+### Training Evolution
+
+| Phase | Architecture | Best Lines | Avg Lines | Episodes |
+|-------|-------------|-----------|-----------|----------|
+| Phase 2b | Dueling Double DQN | 100 | 47 | 119k |
+| **Phase 3** | **Afterstate V-learning** | **1,766** | **140** | **100k** |
+
+The afterstate architecture delivered a **17.7x improvement** in best game performance and **3x improvement** in average lines compared to the previous Dueling Double DQN approach. Training was still accelerating at session end — no plateau observed.
 
 ---
 
